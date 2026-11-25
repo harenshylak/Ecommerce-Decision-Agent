@@ -20,7 +20,17 @@ from ecommerce_agent.oversight import Oversight, audit
 from ecommerce_agent.persistence import ServiceError, transaction
 
 TERMINAL = ("PROPOSED", "NO_OP", "ESCALATED", "TIMED_OUT", "FAILED")
-USAGE_KEYS = ("model_calls", "input_tokens", "output_tokens", "tool_calls", "compare_calls")
+USAGE_KEYS = (
+    "model_calls",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "tool_calls",
+    "compare_calls",
+    "invalid_tool_calls",
+    "model_errors",
+    "uncertain_calls",
+)
 
 
 def review_blocker(dsn, tenant, token=None):
@@ -137,6 +147,10 @@ class InvestigationContext:
     def trace(self, data):
         self.worker._trace(self.run_id, self.lease_owner, data)
 
+    def traces(self):
+        """Every step this investigation saved so far, across attempts, in order."""
+        return self.worker._traces(self.run_id, self.lease_owner)
+
     def check_deadline(self):
         if time.monotonic() > self.deadline:
             raise InvestigationTimeout("investigation wall-clock budget exhausted")
@@ -242,6 +256,18 @@ class InvestigationWorker:
                 "INSERT INTO app.thread_records VALUES(%s,%s,%s,'trace',%s)",
                 (self.tenant, run_id, sequence, Jsonb(data)),
             )
+
+    def _traces(self, run_id, lease_owner):
+        with transaction(self.dsn) as conn:
+            self._owned(conn, run_id, lease_owner)
+            return [
+                r["data"]
+                for r in conn.execute(
+                    "SELECT data FROM app.thread_records WHERE tenant_id=%s AND run_id=%s "
+                    "AND kind='trace' ORDER BY sequence",
+                    (self.tenant, run_id),
+                ).fetchall()
+            ]
 
     def _context(self, run_id, lease_owner):
         with transaction(self.dsn) as conn:

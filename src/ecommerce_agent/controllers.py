@@ -73,14 +73,16 @@ def fixed_controller(base_history: SalesHistory):
     return run
 
 
-def controller_registry(base_history: SalesHistory) -> dict:
-    """Agents are connected in Phases 3D/3E; until then they are not runnable."""
+def controller_registry(base_history: SalesHistory, client_factory=None) -> dict:
+    """The multi-agent team is connected in Phase 3E; until then it is not runnable."""
+    from ecommerce_agent.agent import single_agent_controller
+    from ecommerce_agent.llm import GatewayClient
 
     def not_ready(context):
         raise NotImplementedError(f"{context.controller} controller is not implemented yet")
 
     return {
         "fixed": fixed_controller(base_history),
-        "single_agent": not_ready,
+        "single_agent": single_agent_controller(base_history, client_factory or GatewayClient),
         "multi_agent": not_ready,
     }

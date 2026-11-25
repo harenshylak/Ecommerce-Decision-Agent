@@ -121,6 +121,8 @@ Initial proposed caps remain six model calls, 18,000 cumulative input tokens, 3,
 
 Exit gate: real gateway calls produce grounded valid proposals, justified no-ops, or safe escalations; restart does not repeat business effects or reset budgets; invalid tools and model failures remain visible.
 
+Status (implemented in `llm.py` and `agent.py`): Portkey gateway, model `@30875-fall26-openai/gpt-5-nano`, reasoning effort low, 1,200 output tokens per call (also the amount charged for an interrupted call). The agent may adopt, trim, or edit the compared bundle; every proposal must pass `validate_plan` and only touch forecast SKUs. Pilot (12 live investigations, three development scenarios): 12/12 validated proposals, 3-5 model calls, 8.2k-15.8k input and 0.9k-1.7k output tokens per investigation, no budget exhaustion, about 1.5 US cents in total. Caps are frozen at six model calls, 18,000 input tokens, 3,000 output tokens, twelve tools including three comparisons, and 90 seconds.
+
 ## Phase 3E Required bounded multi-agent system
 
 After the single-agent gate, implement and trial a supervisor with inventory and pricing specialists using the same tools and observations. The supervisor reconciles one final proposal under shared cash. Specialists cannot approve or execute. Count all team calls, tokens, tools, retries, and coordination toward one aggregate budget. No RAG or extra document agent is added.
