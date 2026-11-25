@@ -68,6 +68,13 @@ def idempotent(conn, tenant, actor, operation, key, request, handler):
     return response
 
 
+def review_gate(conn, tenant):
+    """Proactive stores may not advance while today's review is missing or unfinished."""
+    reason = conn.execute("SELECT app.review_blocker(%s) AS reason", (tenant,)).fetchone()
+    if reason["reason"]:
+        raise ServiceError("review_pending", reason["reason"])
+
+
 def check_payload(payload, snapshot, config):
     if payload.tenant_id != snapshot.tenant_id:
         raise ServiceError("forbidden", "proposal scope mismatch", 403)
@@ -235,7 +242,7 @@ class Oversight:
                     conn.execute(
                         (
                             "UPDATE app.investigations SET state='PROPOSED' WHERE te"
-                            "nant_id=%s AND run_id=%s"
+                            "nant_id=%s AND run_id=%s AND state<>'LEASED'"
                         ),
                         (tenant, run_id),
                     )
@@ -376,6 +383,7 @@ class Oversight:
                     raise ServiceError("disabled", "sandbox mutations are paused")
                 if store["snapshot"]["snapshot_version"] != snapshot_version:
                     raise ServiceError("stale", "stale snapshot")
+                review_gate(conn, tenant)
                 job_id = uuid4()
                 conn.execute(
                     (
@@ -422,3 +430,30 @@ class Oversight:
             if not row:
                 raise ServiceError("forbidden", "receipt access denied", 403)
             return row["receipt"]
+
+    def list_alerts(self, token, tenant, status=None):
+        if status not in {None, "OPEN", "RESOLVED"}:
+            raise ServiceError("status", "status must be OPEN or RESOLVED", 422)
+        with transaction(self.dsn, token) as conn:
+            require_member(conn, tenant)
+            alerts = conn.execute(
+                "SELECT alert_id,alert_type,sku,order_id,severity,status,evidence,"
+                "detector_version,opened_day,last_day,resolved_day,last_snapshot_version "
+                "FROM app.alerts WHERE tenant_id=%s AND (%s::text IS NULL OR status=%s) "
+                "ORDER BY status,opened_day,alert_type,sku",
+                (tenant, status, status),
+            ).fetchall()
+            events = conn.execute(
+                "SELECT alert_id,kind,day,snapshot_version,severity FROM app.alert_events "
+                "WHERE tenant_id=%s ORDER BY created_at",
+                (tenant,),
+            ).fetchall()
+            history = {}
+            for event in events:
+                history.setdefault(event["alert_id"], []).append(
+                    {k: v for k, v in event.items() if k != "alert_id"}
+                )
+            return {
+                "tenant_id": tenant,
+                "alerts": [a | {"events": history.get(a["alert_id"], [])} for a in alerts],
+            }

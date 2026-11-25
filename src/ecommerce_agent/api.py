@@ -123,6 +123,15 @@ def create_app(database_url: str | None = None) -> FastAPI:
     ):
         return api.observed_sales(auth, tenant_id, lookback_days)
 
+    @app.get("/alerts")
+    def alerts(
+        status: Annotated[str | None, Query(pattern="^(OPEN|RESOLVED)$")] = None,
+        tenant: str = tenant_header,
+        auth=auth_dependency,
+        api=service_dependency,
+    ):
+        return api.list_alerts(auth, tenant, status)
+
     @app.post("/investigations", status_code=202)
     def investigate(
         body: InvestigationRequest,

@@ -131,11 +131,13 @@ class PlanningModel:
                         * (candidate.price_cents / product.price_cents) ** elasticity
                     )
                     # Planning namespace/seed never use the evaluator's seed or future draws.
+                    # Keyed by simulated day, not snapshot version: executions bump the version,
+                    # and planner randomness must not depend on how many changes were committed.
                     u = uniform(
                         config.planning.planning_seed,
                         "planning-rollout",
                         snapshot.tenant_id,
-                        snapshot.snapshot_version,
+                        snapshot.day,
                         snapshot.policy_version,
                         candidate.sku,
                         str(point.date),

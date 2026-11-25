@@ -10,7 +10,13 @@ from psycopg.types.json import Jsonb
 from ecommerce_agent.contracts import ProposalPayload, StoreSnapshot, payload_hash
 from ecommerce_agent.durable_simulator import checkpoint, reconcile_receipts, restore
 from ecommerce_agent.execution import apply_actions
-from ecommerce_agent.oversight import audit, check_payload, locked_store, policy_config
+from ecommerce_agent.oversight import (
+    audit,
+    check_payload,
+    locked_store,
+    policy_config,
+    review_gate,
+)
 from ecommerce_agent.persistence import ServiceError, transaction
 
 
@@ -208,6 +214,7 @@ class Worker:
             job = self._job(conn, job_id, lease_owner)
             if not store["execution_enabled"]:
                 raise ServiceError("disabled", "sandbox mutations are paused")
+            review_gate(conn, self.tenant)
             valid = conn.execute(
                 "SELECT authn.lock_identity(%s,%s,%s,true) AS valid",
                 (self.tenant, job["actor_id"], job["session_id"]),
