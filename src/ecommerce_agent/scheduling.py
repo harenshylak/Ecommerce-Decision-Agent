@@ -30,6 +30,7 @@ USAGE_KEYS = (
     "invalid_tool_calls",
     "model_errors",
     "uncertain_calls",
+    "delegations",
 )
 
 

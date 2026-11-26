@@ -31,16 +31,21 @@ MILLI_PER_USD = 100_000
 
 ANALYSIS_TOOLS = {"forecast_demand", "compare_plans"}
 
-SYSTEM_PROMPT = """You are the review agent for a small online store. Each review you decide \
-whether to reorder stock, change prices, or make no change. A human merchant approves or rejects \
-whatever you propose; you cannot execute anything yourself.
-
-Rules enforced by validate_plan (it is authoritative):
+RULES = """Rules enforced by validate_plan (it is authoritative):
 - Prices must stay within the allowed_price_cents range shown for each product (90-110% of the \
 reference price and at least {margin}% gross margin). A product's price may change at most once \
 every {cooldown} days.
 - Purchase orders: multiples of {case} units, {min_order}-{max_order} units, ${fee} fee per \
-order, paid from cash. Stock arrives after the supplier lead time.
+order, paid from cash. Stock arrives after the supplier lead time."""
+
+SYSTEM_PROMPT = (
+    """You are the review agent for a small online store. Each review you decide \
+whether to reorder stock, change prices, or make no change. A human merchant approves or rejects \
+whatever you propose; you cannot execute anything yourself.
+
+"""
+    + RULES
+    + """
 
 How to work:
 - Use tools for every number. Do not do your own forecasting or profit arithmetic.
@@ -54,6 +59,7 @@ everything is best, or "escalation" when the evidence is contradictory or tools 
 - Keep the explanation short and concrete; cite the tool results you relied on.
 You have a small budget of model and tool calls. Be efficient: a typical review is forecast \
 -> compare -> (optional validate) -> submit."""
+)
 
 _ACTION_ITEM = {
     "type": "object",
@@ -289,12 +295,26 @@ def actions_from(items):
     return normalize_actions(values)
 
 
-def _estimate_tokens(messages):
+def _estimate_tokens(messages, specs=TOOL_SPECS):
     """Conservative pre-call estimate (JSON characters / 3) for reserving input allowance."""
-    return (len(json.dumps(messages)) + len(json.dumps(TOOL_SPECS))) // 3
+    return (len(json.dumps(messages)) + len(json.dumps(specs))) // 3
 
 
-class AgentRun:
+def policy_values(config):
+    policy = config.operating
+    return {
+        "margin": policy.minimum_gross_margin_percent,
+        "cooldown": policy.price_cooldown_days,
+        "case": policy.case_pack,
+        "min_order": policy.minimum_order_units,
+        "max_order": policy.maximum_order_units,
+        "fee": policy.order_fee_cents / 100,
+    }
+
+
+class Team:
+    """State shared by every conversation in one investigation: tools, evidence, budget."""
+
     def __init__(self, context: InvestigationContext, tools, client):
         self.c, self.tools, self.client = context, tools, client
         self.limits = context.config.model
@@ -302,132 +322,40 @@ class AgentRun:
         # so a resumed run's replays and the mandatory submit validation are never refused here.
         model = self.limits.model_copy(update={"max_tool_calls": 10**6, "max_compare_calls": 10**6})
         tools.config = tools.config.model_copy(update={"model": model})
-        self.messages: list[dict] = []
         self.evidence: list[str] = []
         self.used_tools: set[str] = set()
-        self.decision: Outcome | None = None
         self.consecutive_errors = 0
-
-    # ---- persistence -------------------------------------------------------------------------
-    def _start(self):
-        snapshot = self.tools.get_store_snapshot()
-        self.c.charge(tool_calls=1)
-        request = self.c.request
-        alerts = [
-            {k: a.get(k) for k in ("alert_type", "sku", "order_id", "severity", "evidence")}
-            for a in request.get("alerts", [])
-        ]
-        opening = {
-            "objective": request.get("objective") or request.get("question"),
-            "review_day": self.c.snapshot.day,
-            "open_alerts": alerts,
-            "store": compact_snapshot(self.c.snapshot, self.c.config),
-        }
-        policy = self.c.config.operating
-        system = SYSTEM_PROMPT.format(
-            margin=policy.minimum_gross_margin_percent,
-            cooldown=policy.price_cooldown_days,
-            case=policy.case_pack,
-            min_order=policy.minimum_order_units,
-            max_order=policy.maximum_order_units,
-            fee=policy.order_fee_cents / 100,
-        )
-        self.messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(opening)},
-        ]
-        self.evidence.append(snapshot["tool_call_id"])
-        self.c.trace(
-            {
-                "kind": "agent_start",
-                "agent_version": AGENT_VERSION,
-                "messages": self.messages,
-                "tool_call_id": snapshot["tool_call_id"],
-                "response": snapshot,
-            }
-        )
+        # Allowance a delegating supervisor keeps for its own final turn while a specialist runs.
+        self.reserved_input = 0
+        self.reserved_output = 0
+        self.saved: list[dict] = []
 
     def load(self):
-        """Rebuild the conversation from saved traces, or start a new one."""
-        traces = [t for t in self.c.traces() if str(t.get("kind", "")).startswith("agent_")]
-        if not traces:
-            self._start()
-            return
-        open_request = None
-        for t in traces:
-            kind = t["kind"]
-            if kind == "agent_start":
-                self.messages = list(t["messages"])
+        """Read saved steps once, restore evidence and server-side forecasts."""
+        self.saved = [t for t in self.c.traces() if str(t.get("kind", "")).startswith("agent_")]
+        for t in self.saved:
+            if t["kind"] in ("agent_start", "agent_tool", "agent_prefetch") and t.get(
+                "tool_call_id"
+            ):
                 self.evidence.append(t["tool_call_id"])
-            elif kind == "agent_model_request":
-                open_request = t
-            elif kind in ("agent_model_response", "agent_model_error", "agent_uncertain"):
-                open_request = None
-                if kind == "agent_model_response":
-                    self.messages.append(t["message"])
-            elif kind == "agent_note":
-                self.messages.append({"role": "user", "content": t["content"]})
-            elif kind == "agent_tool":
-                self.messages.append(
-                    {"role": "tool", "tool_call_id": t["call_id"], "content": t["content"]}
-                )
-                if t.get("tool_call_id"):
-                    self.evidence.append(t["tool_call_id"])
+                if t["kind"] != "agent_start":
                     self.used_tools.add(t["name"])
-                if t["name"] == "forecast_demand" and t.get("tool_call_id"):
-                    self.tools.forecast(t["arguments"]["skus"])  # Restore server-side forecasts.
-            elif kind == "agent_decision":
-                self.decision = Outcome(
-                    t["outcome"],
-                    t["explanation"],
-                    tuple(normalize_actions(t["actions"])),
-                    tuple(t["evidence_ids"]),
-                )
-        if open_request is not None:  # Died mid-call: the provider may have billed it.
-            self.c.charge(
-                input_tokens=open_request["reserved_input"],
-                output_tokens=open_request["reserved_output"],
-                uncertain_calls=1,
-            )
-            self.c.trace({"kind": "agent_uncertain", "n": open_request["n"]})
+                    if t["name"] == "forecast_demand":
+                        self.tools.forecast(t["arguments"]["skus"])
 
-    # ---- tools -------------------------------------------------------------------------------
-    def _pending_calls(self):
-        """Tool calls of the latest model turn that have no saved result yet."""
-        index = next(
-            (
-                i
-                for i in range(len(self.messages) - 1, -1, -1)
-                if self.messages[i]["role"] == "assistant"
-            ),
-            None,
-        )
-        if index is None or not self.messages[index].get("tool_calls"):
-            return []
-        answered = {
-            m.get("tool_call_id") for m in self.messages[index + 1 :] if m["role"] == "tool"
+    def opening(self):
+        request = self.c.request
+        return {
+            "objective": request.get("objective") or request.get("question"),
+            "review_day": self.c.snapshot.day,
+            "open_alerts": [
+                {k: a.get(k) for k in ("alert_type", "sku", "order_id", "severity", "evidence")}
+                for a in request.get("alerts", [])
+            ],
+            "store": compact_snapshot(self.c.snapshot, self.c.config),
         }
-        return [c for c in self.messages[index]["tool_calls"] if c["id"] not in answered]
 
-    def _reply(self, call, name, arguments, content, response=None):
-        content = json.dumps(content)
-        self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": content})
-        self.c.trace(
-            {
-                "kind": "agent_tool",
-                "call_id": call["id"],
-                "name": name,
-                "arguments": arguments,
-                "content": content,
-                "tool_call_id": response["tool_call_id"] if response else None,
-                "response": response,
-            }
-        )
-        if response:
-            self.evidence.append(response["tool_call_id"])
-            self.used_tools.add(name)
-
-    def _run_tool(self, name, args):
+    def run_tool(self, name, args):
         if name == "get_sales_history":
             lookback = min(56, max(7, int(args["lookback_days"])))
             return self.tools.get_sales_history(args["skus"], lookback)
@@ -441,35 +369,8 @@ class AgentRun:
             return self.tools.validate(actions_from(args["actions"]))
         raise ValueError(f"unknown tool {name!r}")
 
-    def _call_tool(self, call):
-        self.c.check_deadline()
-        name = call["function"]["name"]
-        try:
-            args = json.loads(call["function"]["arguments"] or "{}")
-        except json.JSONDecodeError:
-            self.c.charge(invalid_tool_calls=1)
-            self._reply(call, name, None, {"error": "arguments were not valid JSON"})
-            return None
-        if name == "submit_decision":
-            return self._submit(call, args)
-        usage = self.c.usage
-        if usage.get("tool_calls", 0) >= self.limits.max_tool_calls or (
-            name == "compare_plans"
-            and usage.get("compare_calls", 0) >= self.limits.max_compare_calls
-        ):
-            self._reply(call, name, args, {"error": "tool budget exhausted; call submit_decision"})
-            return None
-        try:
-            response = self._run_tool(name, args)
-        except (ValueError, TypeError, KeyError) as exc:
-            self.c.charge(tool_calls=1, invalid_tool_calls=1)
-            self._reply(call, name, args, {"error": str(exc)[:300]})
-            return None
-        self.c.charge(tool_calls=1, compare_calls=int(name == "compare_plans"))
-        self._reply(call, name, args, compact(name, response), response)
-        return None
-
-    def _check_submission(self, args):
+    def check_decision(self, args):
+        """Final-decision rules shared by the single agent and the supervisor."""
         decision = args.get("decision")
         explanation = str(args.get("explanation", "")).strip()
         if decision not in ("proposal", "no_op", "escalation") or not explanation:
@@ -497,50 +398,214 @@ class AgentRun:
             )
         return Outcome("proposal", explanation, actions, tuple(self.evidence))
 
-    def _submit(self, call, args):
-        try:
-            outcome = self._check_submission(args)
-        except (SubmissionRejected, ValueError, TypeError, KeyError) as exc:
-            self.c.charge(invalid_tool_calls=1)
-            self._reply(call, "submit_decision", args, {"accepted": False, "error": str(exc)[:500]})
-            return None
-        self._reply(call, "submit_decision", args, {"accepted": True})
-        self.c.trace(
+
+class Conversation:
+    """One bounded model conversation (the single agent, the supervisor, or a specialist).
+
+    Every step is saved with this conversation's `conv` tag so a retry can rebuild it. Budget
+    checks read the investigation's persisted usage, which all conversations share.
+    """
+
+    def __init__(
+        self,
+        team: Team,
+        conv: str,
+        *,
+        specs,
+        finish,
+        handlers=None,
+        allowance=None,
+        forced_finish=None,
+        output_ceiling=MAX_OUTPUT_PER_CALL,
+    ):
+        self.team, self.conv, self.specs = team, conv, specs
+        self.finish = finish  # callable(conversation, args) -> result; raises SubmissionRejected
+        self.finish_name = forced_finish or "submit_decision"
+        self.handlers = handlers or {}
+        self.allowance = allowance  # Max model calls for this conversation, None = team cap.
+        self.output_ceiling = output_ceiling
+        self.allowed = {s["function"]["name"] for s in specs}
+        self.messages: list[dict] = []
+        self.local_calls = 0
+        self.result = None
+
+    @property
+    def c(self):
+        return self.team.c
+
+    def _trace(self, data):
+        self.c.trace(data | {"conv": self.conv})
+
+    # ---- persistence -------------------------------------------------------------------------
+    def start(self, system, opening, snapshot=None, **extra):
+        self.messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(opening)},
+        ]
+        limits = self.team.limits
+        record = {
+            "kind": "agent_start",
+            "agent_version": AGENT_VERSION,
+            "messages": self.messages,
+            "limits": {
+                "max_model_calls": limits.max_model_calls,
+                "max_input_tokens": limits.max_input_tokens,
+                "max_output_tokens": limits.max_output_tokens,
+                "max_tool_calls": limits.max_tool_calls,
+                "max_compare_calls": limits.max_compare_calls,
+                "output_per_call": self.output_ceiling,
+            },
+        } | extra
+        if snapshot:
+            self.team.evidence.append(snapshot["tool_call_id"])
+            record |= {"tool_call_id": snapshot["tool_call_id"], "response": snapshot}
+        self._trace(record)
+
+    def restore(self):
+        """Rebuild from saved steps. Returns False when this conversation never started."""
+        mine = [t for t in self.team.saved if t.get("conv", "main") == self.conv]
+        if not mine:
+            return False
+        open_request = None
+        for t in mine:
+            kind = t["kind"]
+            if kind == "agent_start":
+                self.messages = list(t["messages"])
+                self.allowance = t.get("allowance", self.allowance)
+            elif kind == "agent_model_request":
+                open_request = t
+                self.local_calls += 1
+            elif kind in ("agent_model_response", "agent_model_error", "agent_uncertain"):
+                open_request = None
+                if kind == "agent_model_response":
+                    self.messages.append(t["message"])
+            elif kind == "agent_note":
+                self.messages.append({"role": "user", "content": t["content"]})
+            elif kind == "agent_tool":
+                self.messages.append(
+                    {"role": "tool", "tool_call_id": t["call_id"], "content": t["content"]}
+                )
+            elif kind == "agent_result":
+                self.result = t["result"]
+        if open_request is not None:  # Died mid-call: the provider may have billed it.
+            self.c.charge(
+                input_tokens=open_request["reserved_input"],
+                output_tokens=open_request["reserved_output"],
+                uncertain_calls=1,
+            )
+            self._trace({"kind": "agent_uncertain", "n": open_request["n"]})
+        return True
+
+    # ---- tools -------------------------------------------------------------------------------
+    def _pending_calls(self):
+        """Tool calls of the latest model turn that have no saved result yet."""
+        index = next(
+            (
+                i
+                for i in range(len(self.messages) - 1, -1, -1)
+                if self.messages[i]["role"] == "assistant"
+            ),
+            None,
+        )
+        if index is None or not self.messages[index].get("tool_calls"):
+            return []
+        answered = {
+            m.get("tool_call_id") for m in self.messages[index + 1 :] if m["role"] == "tool"
+        }
+        return [c for c in self.messages[index]["tool_calls"] if c["id"] not in answered]
+
+    def reply(self, call, name, arguments, content, response=None):
+        content = json.dumps(content)
+        self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": content})
+        self._trace(
             {
-                "kind": "agent_decision",
-                "outcome": outcome.kind,
-                "explanation": outcome.explanation,
-                "actions": [a.model_dump() for a in outcome.actions],
-                "evidence_ids": list(outcome.evidence_ids),
+                "kind": "agent_tool",
+                "call_id": call["id"],
+                "name": name,
+                "arguments": arguments,
+                "content": content,
+                "tool_call_id": response["tool_call_id"] if response else None,
+                "response": response,
             }
         )
-        return outcome
+        if response:
+            self.team.evidence.append(response["tool_call_id"])
+            self.team.used_tools.add(name)
+
+    def _call_tool(self, call):
+        """Run one requested tool. Returns True when the conversation's finish was accepted."""
+        self.c.check_deadline()
+        name = call["function"]["name"]
+        try:
+            args = json.loads(call["function"]["arguments"] or "{}")
+        except json.JSONDecodeError:
+            self.c.charge(invalid_tool_calls=1)
+            self.reply(call, name, None, {"error": "arguments were not valid JSON"})
+            return False
+        if name == self.finish_name:
+            try:
+                result = self.finish(self, args)
+            except (SubmissionRejected, ValueError, TypeError, KeyError) as exc:
+                self.c.charge(invalid_tool_calls=1)
+                self.reply(call, name, args, {"accepted": False, "error": str(exc)[:500]})
+                return False
+            self.reply(call, name, args, {"accepted": True})
+            self._trace({"kind": "agent_result", "result": result})
+            self.result = result
+            return True
+        if name in self.handlers:
+            self.reply(call, name, args, self.handlers[name](call, args))
+            return False
+        if name not in self.allowed:
+            self.c.charge(tool_calls=1, invalid_tool_calls=1)
+            self.reply(call, name, args, {"error": f"unknown tool {name!r} for this role"})
+            return False
+        usage, limits = self.c.usage, self.team.limits
+        if usage.get("tool_calls", 0) >= limits.max_tool_calls or (
+            name == "compare_plans" and usage.get("compare_calls", 0) >= limits.max_compare_calls
+        ):
+            self.reply(call, name, args, {"error": "tool budget exhausted; finish now"})
+            return False
+        try:
+            response = self.team.run_tool(name, args)
+        except (ValueError, TypeError, KeyError) as exc:
+            self.c.charge(tool_calls=1, invalid_tool_calls=1)
+            self.reply(call, name, args, {"error": str(exc)[:300]})
+            return False
+        self.c.charge(tool_calls=1, compare_calls=int(name == "compare_plans"))
+        self.reply(call, name, args, compact(name, response), response)
+        return False
 
     # ---- model -------------------------------------------------------------------------------
     def _call_model(self):
         """One budgeted model call. Returns False when the budget cannot afford another call."""
         self.c.check_deadline()
-        usage = self.c.usage
+        team, usage = self.team, self.c.usage
+        limits = team.limits
         calls = usage.get("model_calls", 0)
-        remaining_output = min(
-            MAX_OUTPUT_PER_CALL, self.limits.max_output_tokens - usage.get("output_tokens", 0)
-        )
-        estimate = _estimate_tokens(self.messages)
+        delegated = self.conv != "main"
+        used_input = usage.get("input_tokens", 0) + (team.reserved_input if delegated else 0)
+        used_output = usage.get("output_tokens", 0) + (team.reserved_output if delegated else 0)
+        remaining_output = min(self.output_ceiling, limits.max_output_tokens - used_output)
+        estimate = _estimate_tokens(self.messages, self.specs)
+        local_cap = self.allowance if self.allowance is not None else limits.max_model_calls
         if (
-            calls >= self.limits.max_model_calls
+            calls >= limits.max_model_calls
+            or self.local_calls >= local_cap
             or remaining_output < MIN_OUTPUT_TOKENS
-            or usage.get("input_tokens", 0) + estimate > self.limits.max_input_tokens
+            or used_input + estimate > limits.max_input_tokens
         ):
             return False
         final = (
-            calls + 1 >= self.limits.max_model_calls
-            or usage.get("input_tokens", 0) + 2 * estimate > self.limits.max_input_tokens
+            calls + 1 >= limits.max_model_calls
+            or self.local_calls + 1 >= local_cap
+            or used_input + 2 * estimate > limits.max_input_tokens
         )
         choice = (
-            {"type": "function", "function": {"name": "submit_decision"}} if final else "required"
+            {"type": "function", "function": {"name": self.finish_name}} if final else "required"
         )
         n = calls + 1
-        self.c.trace(
+        self._trace(
             {
                 "kind": "agent_model_request",
                 "n": n,
@@ -549,10 +614,11 @@ class AgentRun:
                 "forced_submit": final,
             }
         )
+        self.local_calls += 1
         self.c.charge(model_calls=1)  # Counted before sending: a crash cannot hide the call.
         try:
-            reply = self.client.complete(
-                self.messages, TOOL_SPECS, tool_choice=choice, max_output_tokens=remaining_output
+            reply = team.client.complete(
+                self.messages, self.specs, tool_choice=choice, max_output_tokens=remaining_output
             )
         except ModelError as exc:
             extra = (
@@ -561,18 +627,18 @@ class AgentRun:
                 else {}
             )
             self.c.charge(model_errors=1, **extra)
-            self.c.trace({"kind": "agent_model_error", "n": n, "error": str(exc)})
-            self.consecutive_errors += 1
-            if not exc.retryable or self.consecutive_errors >= 2:
+            self._trace({"kind": "agent_model_error", "n": n, "error": str(exc)})
+            team.consecutive_errors += 1
+            if not exc.retryable or team.consecutive_errors >= 2:
                 raise  # The worker releases the lease; a later attempt resumes from here.
             return True
-        self.consecutive_errors = 0
+        team.consecutive_errors = 0
         self.c.charge(
             input_tokens=reply.input_tokens or estimate,
             output_tokens=reply.output_tokens,
             reasoning_tokens=reply.reasoning_tokens,
         )
-        self.c.trace(
+        self._trace(
             {
                 "kind": "agent_model_response",
                 "n": n,
@@ -588,34 +654,74 @@ class AgentRun:
         )
         self.messages.append(reply.message)
         if not reply.message.get("tool_calls"):
-            note = "Reply only with tool calls. Finish with submit_decision."
+            note = f"Reply only with tool calls. Finish with {self.finish_name}."
             self.messages.append({"role": "user", "content": note})
-            self.c.trace({"kind": "agent_note", "content": note})
+            self._trace({"kind": "agent_note", "content": note})
         return True
 
-    def run(self) -> Outcome:
-        self.load()
-        while self.decision is None:
+    def run(self):
+        """Loop until the finish tool is accepted (returns its result) or budget ends (None)."""
+        while self.result is None:
             for call in self._pending_calls():
-                outcome = self._call_tool(call)
-                if outcome is not None:
-                    self.decision = outcome
+                if self._call_tool(call):
                     break
-            if self.decision is not None:
+            if self.result is not None:
                 break
             if not self._call_model():
-                return Outcome(
-                    "escalation",
-                    "The agent's review budget ran out before a validated decision; "
-                    "a merchant should review.",
-                    evidence_ids=tuple(self.evidence),
-                )
-        return self.decision
+                return None
+        return self.result
+
+
+def outcome_record(outcome: Outcome):
+    return {
+        "outcome": outcome.kind,
+        "explanation": outcome.explanation,
+        "actions": [a.model_dump() for a in outcome.actions],
+        "evidence_ids": list(outcome.evidence_ids),
+    }
+
+
+def outcome_from(record) -> Outcome:
+    return Outcome(
+        record["outcome"],
+        record["explanation"],
+        tuple(normalize_actions(record["actions"])),
+        tuple(record["evidence_ids"]),
+    )
+
+
+BUDGET_ESCALATION = (
+    "The review budget ran out before a validated decision; a merchant should review."
+)
+
+
+def run_decision_conversation(team: Team, specs, system, handlers_for=None) -> Outcome:
+    """The top-level conversation (single agent or supervisor) ending in submit_decision.
+
+    `handlers_for(main)` may add non-numerical tools, such as the supervisor's delegations."""
+    team.load()
+    main = Conversation(
+        team,
+        "main",
+        specs=specs,
+        finish=lambda conv, args: outcome_record(team.check_decision(args)),
+    )
+    if handlers_for:
+        main.handlers = handlers_for(main)
+    if not main.restore():
+        snapshot = team.tools.get_store_snapshot()
+        team.c.charge(tool_calls=1)
+        main.start(system, team.opening(), snapshot)
+    record = main.run()
+    if record is None:
+        return Outcome("escalation", BUDGET_ESCALATION, evidence_ids=tuple(team.evidence))
+    return outcome_from(record)
 
 
 def single_agent_controller(base_history: SalesHistory, client_factory=GatewayClient):
     def run(context: InvestigationContext) -> Outcome:
-        tools = tools_for(context, base_history)
-        return AgentRun(context, tools, client_factory()).run()
+        team = Team(context, tools_for(context, base_history), client_factory())
+        system = SYSTEM_PROMPT.format(**policy_values(context.config))
+        return run_decision_conversation(team, TOOL_SPECS, system)
 
     return run
